@@ -1,0 +1,22 @@
+services:
+  mttl-bridge:
+    build: .
+    image: mttl-w01-matterbridge:local
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      TCP_PORT: ${TCP_PORT:-10086}
+      HTTP_PORT: ${HTTP_PORT:-8086}
+      MATTER_PORT: ${MATTER_PORT:-5540}
+      MATTER_PASSCODE: ${MATTER_PASSCODE:-20202021}
+      MATTER_DISCRIMINATOR: ${MATTER_DISCRIMINATOR:-3840}
+      MTTL_POLL_INTERVAL_MS: ${MTTL_POLL_INTERVAL_MS:-10000}
+      MTTL_RESPONSE_TIMEOUT_MS: ${MTTL_RESPONSE_TIMEOUT_MS:-3000}
+    volumes:
+      - devices:/app/data
+      - matter:/root/.matter
+
+volumes:
+  devices:
+  matter:

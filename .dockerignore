@@ -1,0 +1,7 @@
+**
+!mttl-w01-matterbridge/
+!mttl-w01-matterbridge/package.json
+!mttl-w01-matterbridge/package-lock.json
+!mttl-w01-matterbridge/tsconfig.json
+!mttl-w01-matterbridge/src/
+!mttl-w01-matterbridge/src/**
