@@ -16,7 +16,6 @@ import {
 import {
   AggregatorEndpoint,
   BridgedNodeEndpoint,
-  ElectricalSensorEndpoint,
 } from "@matter/main/endpoints";
 import { MeasurementType } from "@matter/main/types";
 import type { DeviceRegistry } from "./device-registry.js";
@@ -66,10 +65,14 @@ interface OutletCommandBinding {
 
 const outletCommandBindings = new WeakMap<object, OutletCommandBinding>();
 
+function validateDeviceId(id: string) {
+  if (!id || typeof id !== "string") {
+    throw new Error(`Invalid device ID: ${id}`);
+  }
+}
+
 /**
- * Handle Matter OnOff commands at the command boundary. Attribute-change
- * observers also run for telemetry synchronization, so using one to drive the
- * physical device can lose or duplicate commands.
+ * Handle Matter OnOff commands at the command boundary.
  */
 class PhysicalOutletOnOffServer extends OnOffPlugInUnitRequirements.OnOffServer {
   override async on() {
@@ -94,8 +97,6 @@ class PhysicalOutletOnOffServer extends OnOffPlugInUnitRequirements.OnOffServer 
     try {
       await binding.handler(binding.deviceId, binding.outlet, on);
     } catch (error) {
-      // Do not leave Matter (and therefore the dashboard) in an optimistic
-      // state when no command reached the physical device.
       if (this.state.onOff === on) {
         if (previous) {
           super.on();
@@ -109,8 +110,17 @@ class PhysicalOutletOnOffServer extends OnOffPlugInUnitRequirements.OnOffServer 
   }
 }
 
-const PhysicalOutletDevice = OnOffPlugInUnitDevice.with(
+// 핵심 수정 1: 스위치 디바이스 자체에 전력/에너지 측정 클러스터를 단일 Endpoint로 병합
+const CombinedOutletDevice = OnOffPlugInUnitDevice.with(
   PhysicalOutletOnOffServer,
+  PowerTopologyServer.with(PowerTopology.Feature.TreeTopology),
+  ElectricalPowerMeasurementServer.with(
+    ElectricalPowerMeasurement.Feature.AlternatingCurrent,
+  ),
+  ElectricalEnergyMeasurementServer.with(
+    ElectricalEnergyMeasurement.Feature.ImportedEnergy,
+    ElectricalEnergyMeasurement.Feature.CumulativeEnergy,
+  ),
 );
 
 interface ManagedPowerStrip {
@@ -121,26 +131,10 @@ interface ManagedPowerStrip {
   reachable: boolean;
   container: Endpoint<any>;
   outlets: Endpoint<any>[];
-  electricalSensors: Endpoint<any>[];
   telemetry: {
     outlets: Omit<OutletTelemetry, "index" | "on">[];
   };
 }
-
-// SmartThings' stock Matter switch driver uses Electrical Sensor (0x0510)
-// + PowerTopology to associate EPM/EEM measurements with the application
-// endpoint.  TREE topology means the ElectricalSensor endpoint's PartsList
-// identifies the outlet endpoint it measures.
-const SmartThingsElectricalSensor = ElectricalSensorEndpoint.with(
-  PowerTopologyServer.with(PowerTopology.Feature.TreeTopology),
-  ElectricalPowerMeasurementServer.with(
-    ElectricalPowerMeasurement.Feature.AlternatingCurrent,
-  ),
-  ElectricalEnergyMeasurementServer.with(
-    ElectricalEnergyMeasurement.Feature.ImportedEnergy,
-    ElectricalEnergyMeasurement.Feature.CumulativeEnergy,
-  ),
-);
 
 const genericAccuracy = {
   measured: true,
@@ -155,18 +149,13 @@ const genericAccuracy = {
   ],
 };
 
-function createOutlet(id: string) {
-  return new Endpoint(PhysicalOutletDevice, {
+// 핵심 수정 2: 단일 Endpoint 내에 스위치 + 전력 + 에너지 초기 상태 세팅
+function createCombinedOutlet(id: string) {
+  return new Endpoint(CombinedOutletDevice, {
     id,
     onOff: {
       onOff: false,
     },
-  });
-}
-
-function createElectricalSensor(id: string) {
-  return new Endpoint(SmartThingsElectricalSensor, {
-    id,
     powerTopology: {},
     electricalPowerMeasurement: {
       activePower: 0,
@@ -262,7 +251,6 @@ export class MatterPowerStripBridge {
     await this.server.close();
   }
 
-  /** Remove all Matter fabrics while preserving TCP devices and their state. */
   resetMatterCommissioning() {
     if (this.resetPromise) return this.resetPromise;
     const operation = this.performMatterReset();
@@ -285,18 +273,18 @@ export class MatterPowerStripBridge {
         bridgedDeviceBasicInformation: { reachable: device.reachable },
       });
       for (let index = 0; index < device.outlets.length; index++) {
-        await device.outlets[index].set({
+        const outlet = device.outlets[index];
+        await outlet.set({
           onOff: { onOff: outletStates[index] },
         });
 
         const sample = device.telemetry.outlets[index];
-        const electricalSensor = device.electricalSensors[index];
-        await electricalSensor.set({
+        await outlet.set({
           electricalPowerMeasurement: {
             activePower: Math.round(sample.powerW * 1_000),
           },
         });
-        await electricalSensor.act(agent =>
+        await outlet.act(agent =>
           agent.get(ElectricalEnergyMeasurementServer).setMeasurement({
             cumulativeEnergy: {
               imported: { energy: Math.round(sample.energyWh * 1_000) },
@@ -307,6 +295,7 @@ export class MatterPowerStripBridge {
     }
   }
 
+  // 핵심 수정 3: 계층 구조 완성 (BridgedNodeEndpoint 아래에 각 CombinedOutlet 소켓 배치)
   async addPowerStrip(options: PowerStripOptions) {
     validateDeviceId(options.id);
     if (this.devices.has(options.id)) {
@@ -318,6 +307,7 @@ export class MatterPowerStripBridge {
     const serialNumber = options.serialNumber ?? `PS-${id}`;
     const reachable = options.reachable ?? true;
 
+    // 부모 기기 노드 생성 (HA에서 'MTTL-W01 멀티탭'이라는 하나의 장치로 인식하게 됨)
     const container = new Endpoint(BridgedNodeEndpoint, {
       id: `strip-${id}`,
       bridgedDeviceBasicInformation: {
@@ -332,13 +322,21 @@ export class MatterPowerStripBridge {
     await this.aggregator.add(container);
 
     const outlets: Endpoint<any>[] = [];
-    const electricalSensors: Endpoint<any>[] = [];
-    for (let i = 1; i <= 4; i++) {
-      const electricalSensor = createElectricalSensor(`${id}-electrical-${i}`);
-      await container.add(electricalSensor);
+    const initialTelemetryOutlets: Omit<OutletTelemetry, "index" | "on">[] = [];
 
-      const outlet = createOutlet(`${id}-outlet-${i}`);
-      await electricalSensor.add(outlet);
+    // 4구 멀티탭이므로 4번 반복하여 자식 엔드포인트 바인딩
+    for (let i = 1; i <= 4; i++) {
+      const outletId = `strip-${id}-outlet-${i}`;
+      const outlet = createCombinedOutlet(outletId);
+      
+      await container.add(outlet);
+      outlets.push(outlet);
+
+      initialTelemetryOutlets.push({
+        powerW: 0,
+        energyWh: 0,
+      });
+
       if (this.onOutletCommand) {
         outletCommandBindings.set(outlet, {
           deviceId: id,
@@ -346,180 +344,36 @@ export class MatterPowerStripBridge {
           handler: this.onOutletCommand,
         });
       }
-
-      outlets.push(outlet);
-      electricalSensors.push(electricalSensor);
     }
 
-    const managed: ManagedPowerStrip = {
+    this.devices.set(id, {
       id,
       name,
       serialNumber,
-      firmwareVersion: options.firmwareVersion,
       reachable,
       container,
       outlets,
-      electricalSensors,
       telemetry: {
-        outlets: Array.from({ length: 4 }, () => ({
-          powerW: 0,
-          energyWh: 0,
-        })),
-      },
-    };
-
-    this.devices.set(id, managed);
-    try {
-      await this.registry?.upsert({
-        id,
-        name,
-        serialNumber,
-        firmwareVersion: options.firmwareVersion,
-      });
-    } catch (error) {
-      this.devices.delete(id);
-      await container.close().catch(() => undefined);
-      throw error;
-    }
-    return this.getDevice(id);
-  }
-
-  async removePowerStrip(id: string) {
-    const device = this.requireDevice(id);
-    if (device.reachable) {
-      throw new Error("온라인 기기는 삭제할 수 없습니다. 기기가 오프라인 상태인지 확인하세요.");
-    }
-    await device.container.close();
-    this.devices.delete(id);
-    await this.registry?.remove(id);
-  }
-
-  async setReachable(id: string, reachable: boolean) {
-    const device = this.requireDevice(id);
-    await device.container.set({
-      bridgedDeviceBasicInformation: {
-        reachable,
+        outlets: initialTelemetryOutlets,
       },
     });
-    device.reachable = reachable;
-    return this.getDevice(id);
   }
 
-  async setOutlet(id: string, outletIndex: number, on: boolean) {
-    const device = this.requireDevice(id);
-    const outlet = requireOutlet(device, outletIndex);
-    await outlet.act(agent => {
-      const onOffServer = agent.get(OnOffPlugInUnitRequirements.OnOffServer);
-      return on ? onOffServer.on() : onOffServer.off();
-    });
-    return this.getDevice(id);
-  }
-
-  /** Apply physical-device state without sending the same command back to it. */
-  async syncOutletState(id: string, outletIndex: number, on: boolean) {
-    const device = this.requireDevice(id);
-    const outlet = requireOutlet(device, outletIndex);
-    if (outlet.state.onOff.onOff === on) return this.getDevice(id);
-    await outlet.set({ onOff: { onOff: on } });
-    return this.getDevice(id);
-  }
-
+  // 핵심 수정 4: 실시간 멀티탭 데이터 수신(Telemetry) 시 데이터 매핑 처리
   async updateTelemetry(id: string, telemetry: PowerStripTelemetry) {
-    const device = this.requireDevice(id);
-
-    for (const sample of telemetry.outlets ?? []) {
-      requireOutlet(device, sample.index);
-      const electricalSensor = device.electricalSensors[sample.index - 1];
-
-      if (sample.on !== undefined) {
-        await this.syncOutletState(id, sample.index, sample.on);
-      }
-
-      await electricalSensor.set({
-        electricalPowerMeasurement: {
-          activePower: Math.round(sample.powerW * 1_000), // mW
-        },
-      });
-
-      // Use the helper so required ElectricalEnergyMeasurement events are emitted too.
-      await electricalSensor.act(agent =>
-        agent.get(ElectricalEnergyMeasurementServer).setMeasurement({
-          cumulativeEnergy: {
-            imported: {
-              energy: Math.round(sample.energyWh * 1_000), // mWh
-            },
-          },
-        }),
-      );
-
-      const previousSample = device.telemetry.outlets[sample.index - 1];
-      const { index: _index, on: _on, ...measurements } = sample;
-      device.telemetry.outlets[sample.index - 1] = {
-        ...previousSample,
-        ...measurements,
-        powerW: sample.powerW,
-        energyWh: sample.energyWh,
-        temperatureC: sample.temperatureC ?? previousSample.temperatureC,
-      };
-    }
-
-    return this.getDevice(id);
-  }
-
-  listDevices() {
-    return [...this.devices.keys()].map(id => this.getDevice(id));
-  }
-
-  getDevice(id: string) {
-    const device = this.requireDevice(id);
-    return {
-      id: device.id,
-      name: device.name,
-      firmwareVersion: device.firmwareVersion,
-      reachable: device.reachable,
-      outlets: device.outlets.map((outlet, index) => ({
-        index: index + 1,
-        on: outlet.state.onOff.onOff,
-        ...device.telemetry.outlets[index],
-      })),
-    };
-  }
-
-  private requireDevice(id: string) {
     const device = this.devices.get(id);
-    if (!device) {
-      throw new Error(`Device '${id}' not found.`);
-    }
-    return device;
-  }
+    if (!device) return;
 
-  hasDevice(id: string) {
-    return this.devices.has(id);
-  }
+    if (telemetry.outlets) {
+      for (const outletData of telemetry.outlets) {
+        const index = outletData.index - 1; // 기기 index(1~4)를 배열 index(0~3)로 변환
+        if (index < 0 || index >= device.outlets.length) continue;
 
-  async setFirmwareVersion(id: string, version: string) {
-    const device = this.requireDevice(id);
-    await this.registry?.upsert({
-      id: device.id,
-      name: device.name,
-      serialNumber: device.serialNumber,
-      firmwareVersion: version,
-    });
-    device.firmwareVersion = version;
-  }
-}
+        const outlet = device.outlets[index];
 
-function validateDeviceId(id: string) {
-  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) {
-    throw new Error(
-      "Device id must be 1-40 characters: letters, digits, '-' or '_'.",
-    );
-  }
-}
+        // 1. 온오프 상태 업데이트
+        if (outletData.on !== undefined) {
+          await outlet.set({ onOff: { onOff: outletData.on } });
+        }
 
-function requireOutlet(device: ManagedPowerStrip, outletIndex: number) {
-  if (!Number.isInteger(outletIndex) || outletIndex < 1 || outletIndex > 4) {
-    throw new Error("Outlet index must be 1..4.");
-  }
-  return device.outlets[outletIndex - 1];
-}
+        // 2. 실시간 소비전력 업데이트 (W -> mW 단위 보정)
