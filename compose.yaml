@@ -1,7 +1,7 @@
 services:
   mttl-bridge:
     build: .
-    image: mttl-w01-matterbridge:local
+    image: https://github.com/brotherswife/mttl-w01-matterbridge
     network_mode: host
     restart: unless-stopped
     stop_grace_period: 30s
